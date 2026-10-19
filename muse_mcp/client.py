@@ -122,13 +122,17 @@ def _real_wake(cookies: str, vm_id: Optional[str]) -> None:
 
     access_token = fetch_access_token(cookies)
     vm_id = vm_id or fetch_session_info(cookies)["vm_id"]
-    rq.post(
+    response = rq.post(
         "https://muse.ai/api/hatch/vm/wake",
         headers=_hatch_headers(cookies, access_token),
         json={"vm_id": vm_id, "retry_count": 0},
         impersonate="chrome",
         timeout=15,
     )
+    if response.status_code in (401, 403):
+        raise AuthError(f"vm/wake -> {response.status_code}")
+    if not 200 <= response.status_code < 300:
+        raise GatewayError(response.status_code, "vm/wake failed")
 
 
 def _is_proactive(event: Dict[str, Any]) -> bool:
@@ -366,8 +370,9 @@ class MuseClient:
             except GatewayError:
                 raise
 
-            stream_id = gateway._open("chat.stream", body=params)
+            # Set before _open: a send that fails midway may still have reached Muse.
             dispatched["value"] = True
+            stream_id = gateway._open("chat.stream", body=params)
             result: Dict[str, Any] = {"ok": True, "sent": True, "stream_id": stream_id}
             if fire_and_forget or wait_seconds == 0:
                 result["waiting"] = False
@@ -701,4 +706,6 @@ class MuseClient:
                     return {"ok": True, "method": method, "result": _redact_text(text)}
             return {"ok": True, "method": method, "result": redact(payload)}
 
-        return self._execute(operation)
+        # A timed-out POST/PATCH/DELETE may already have run; only reads retry.
+        is_read = ROUTES[method].get("http") == "GET"
+        return self._execute(operation, can_retry=lambda: is_read)

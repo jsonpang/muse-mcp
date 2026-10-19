@@ -442,6 +442,64 @@ class MainChatAndRetryTests(unittest.TestCase):
         self.assertEqual(client.session("start", title="T")["error"]["code"], "TIMEOUT")
         self.assertEqual(len(starts), 1)
 
+    def test_send_open_failure_is_not_retried(self):
+        class BrokenOpen(FakeGateway):
+            def _open(self, method, body=None):
+                self.opened.append((method, body))
+                raise ConnectionError("dropped mid-send")
+
+        gateways = []
+        client = self.client_for(lambda *a, **k: gateways.append(BrokenOpen()) or gateways[-1])
+        self.assertEqual(client.send("do it", fire_and_forget=True)["error"]["code"], "GATEWAY_ERROR")
+        self.assertEqual(len(gateways), 1)
+
+    def test_raw_retries_reads_but_not_writes(self):
+        class TimesOut(FakeGateway):
+            def request(self, method, path_params=None, body=None, query=None, timeout=30):
+                self.requests.append(method)
+                raise TimeoutError("no response")
+
+        for method, expected in (("feed.list", 3), ("session.start", 1)):
+            gateways = []
+            client = MuseClient(
+                config_loader=lambda: config_for(self.cookie_file, enable_raw=True),
+                gateway_factory=lambda *a, **k: gateways.append(TimesOut()) or gateways[-1],
+                waker=lambda *a: None,
+                sleep=self.sleeps.append,
+            )
+            with patch.dict(os.environ, {"MUSE_MCP_ENABLE_RAW": "1"}):
+                self.assertEqual(client.raw(method)["error"]["code"], "TIMEOUT")
+            self.assertEqual(len(gateways), expected, method)
+
+    def test_wake_failure_is_reported(self):
+        client = self.client_for(lambda *a, **k: FakeGateway())
+        client._waker = lambda *a: (_ for _ in ()).throw(AuthError("vm/wake -> 401"))
+        self.assertEqual(client.wake()["error"]["code"], "AUTH_REQUIRED")
+
+    def test_server_tools_do_not_block_each_other(self):
+        import asyncio
+        from muse_mcp import server
+
+        class Slow:
+            def watch(self, **_k):
+                time.sleep(1.0)
+                return {"ok": True}
+
+            def unread(self):
+                return {"ok": True}
+
+        async def scenario():
+            slow = asyncio.create_task(server.mcp.call_tool("muse_watch", {"seconds": 1}))
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            await server.mcp.call_tool("muse_unread", {})
+            elapsed = time.monotonic() - started
+            await slow
+            return elapsed
+
+        with patch.object(server, "_client", Slow()):
+            self.assertLess(asyncio.run(scenario()), 0.5)
+
     def test_wake_tool(self):
         self.assertTrue(self.client_for(lambda *a, **k: FakeGateway()).wake()["requested"])
         offline = MuseClient(config_loader=lambda: config_for(self.cookie_file), gateway_factory=lambda *a, **k: FakeGateway())
