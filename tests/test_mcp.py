@@ -127,6 +127,31 @@ class MCPClientTests(unittest.TestCase):
         self.assertEqual(result["reply"]["text"], "done")
         self.assertEqual(gateway.opened[0][1]["session_id"], "thread-1")
 
+    def test_send_waits_for_streaming_reply_to_finish(self):
+        def reply(text, streaming):
+            meta = {"streaming": True} if streaming else {}
+            return {"seq": 3, "event_name": "message.assistant", "payload": {"display_text": text, "metadata": meta}}
+
+        gateway = FakeGateway(history=[{"chat_events": [{"seq": 1}]},
+                                       {"chat_events": [reply("查", True)]},
+                                       {"chat_events": [reply("查完了，监控在正常跑。", False)]}])
+        client = self.make_client(gateway)
+        with patch.object(client_module.time, "sleep"):
+            result = client.send("status?", wait_seconds=30)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reply"]["text"], "查完了，监控在正常跑。")
+        self.assertNotIn("raw", result["reply"])
+
+    def test_send_timeout_while_streaming_returns_partial(self):
+        streaming = {"seq": 3, "event_name": "message.assistant",
+                     "payload": {"display_text": "查", "metadata": {"streaming": True}}}
+        gateway = FakeGateway(history=[{"chat_events": [{"seq": 1}]}] + [{"chat_events": [streaming]}] * 5)
+        client = self.make_client(gateway)
+        result = client.send("status?", wait_seconds=0.01)
+        self.assertEqual(result["error"]["code"], "TIMEOUT")
+        self.assertEqual(result["partial_reply"]["text"], "查")
+        self.assertIn("still writing", result["error"]["message"])
+
     def test_send_invalid_thread_is_structured(self):
         class InvalidThreadGateway(FakeGateway):
             def call_json(self, method, body=None, query=None, timeout=30):

@@ -143,6 +143,21 @@ def _is_proactive(event: Dict[str, Any]) -> bool:
     return bool(event.get("reply_to_message_id") or payload.get("reply_to_message_id"))
 
 
+def _is_streaming_reply(event: Dict[str, Any], baseline: int) -> bool:
+    """A genuine reply Muse has started but not finished writing."""
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    if not meta.get("streaming"):
+        return False
+    return is_reply({**event, "payload": {**payload, "metadata": {**meta, "streaming": False}}}, baseline)
+
+
+def _reply_row(event: Dict[str, Any]) -> Dict[str, Any]:
+    row = _event_row(event)
+    row.pop("raw", None)
+    return row
+
+
 def _first_text(*values: Any) -> str:
     for value in values:
         if isinstance(value, str) and value:
@@ -382,6 +397,7 @@ class MuseClient:
 
             timeout = 90 if wait_seconds is None else float(wait_seconds)
             deadline = time.monotonic() + timeout
+            partial = None
             while time.monotonic() < deadline:
                 try:
                     history = gateway.call_json("chat.history", body={"limit": 10, **scope})
@@ -391,8 +407,10 @@ class MuseClient:
                         key=lambda item: item.get("seq", 0) or 0,
                     ):
                         if is_reply(event, baseline):
-                            result["reply"] = _event_row(event)
+                            result["reply"] = _reply_row(event)
                             return result
+                        if _is_streaming_reply(event, baseline):
+                            partial = event
                 except TimeoutError:
                     # Polling timeouts are transient; keep waiting until the caller's deadline.
                     pass
@@ -408,6 +426,9 @@ class MuseClient:
                 "message": "Muse request was dispatched, but no genuine assistant reply arrived before the requested timeout.",
                 "wait_seconds": timeout,
             }
+            if partial is not None:
+                result["error"]["message"] = "Muse is still writing its reply; read it later with muse_history or muse_main_since."
+                result["partial_reply"] = _reply_row(partial)
             result["waiting"] = True
             return result
 
